@@ -1,0 +1,870 @@
+---
+title: "2022 HMDA Data Analysis — CS544 Spring 2024 O1"
+author: "Dahalia Howell"
+output:
+  html_document:
+    fig_width: 8
+    code_folding: hide
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+# Analysis of Lending Practices in Massachusetts
+
+The Home Mortgage Disclosure Act (HMDA) mandates that many financial institutions maintain, report, and publicly disclose loan-level information regarding mortgages. This data serves multiple purposes: it reveals whether lenders are effectively meeting the housing needs of their communities, provides public officials with insights to inform policy decisions, and highlights lending patterns that may indicate discriminatory practices. In this analysis, I explore the 2022 HMDA dataset to uncover trends in lending practices within Massachusetts. Specifically, I aim to identify any disparities in loan approvals among various demographic groups or geographic regions within the state.
+
+The dataset can be accessed from: [HMDA 2022 Massachusetts Data](https://ffiec.cfpb.gov/data-browser/data/2022?category=states&items=MA)
+
+For more information on the HMDA Data Fields, visit: [Public HMDA - LAR Data Fields Documentation](https://ffiec.cfpb.gov/documentation/publications/loan-level-datasets/lar-data-fields)
+
+This analysis seeks to provide valuable insights into lending activities, contributing to a better understanding of housing finance dynamics and facilitating informed decision-making processes.
+
+
+## Data Preparation
+
+```{r echo=TRUE}
+library(tidyverse)
+library(plotly)
+library(sampling)
+
+# Loading data from csv file
+data <- read.csv("data/state_MA.csv")
+
+# Filtering relevant variables for analysis
+set.seed(7472)
+data <- data %>% 
+  sample_n(10000, replace = FALSE) %>% 
+  select(loan_amount, income, interest_rate, debt_to_income_ratio, applicant_age, applicant_race = derived_race, applicant_sex = derived_sex, loan_type, loan_purpose, county = county_code, approval_status = action_taken) 
+
+# Previewing data
+str(data)
+
+```
+At a glance it's clear that some data type conversions are required. The interest rate measure will be be useful for this analysis, however, it is stored as character type. Converting it to a numeric type is necessary to proceed.
+```{r echo=TRUE}
+# Converting to appropriate data types
+data <- data %>% 
+  mutate(
+    interest_rate = as.numeric(interest_rate)
+  )
+```
+### Summary of Numeric Variables
+
+Here, descriptive statistics are calculated for numeric variables including loan_amount, income, and interest_rate.
+```{r echo=TRUE}
+# Descriptive Stats of numeric variables
+sum_data <- data.frame(
+  loan_amount = as.vector(summary(data$loan_amount)),
+  income = as.vector(summary(data$income))[-7], # Excluding NA from summary
+  interest_rate = as.vector(summary(data$interest_rate))[-7] # Excluding NA from summary
+)
+
+rownames(sum_data) <- c("Min", "Q1", "Q2", "Mean", "Q3", "Max")
+sum_data
+
+```
+Immediately, we see the negative income. I will assume this is data error and remove it from the data.
+```{r echo=TRUE}
+
+data <- data %>% 
+  filter(income >= 0)
+
+sum_data <- sum_data %>% 
+  mutate(
+    income = as.vector(summary(data$income, na.rm = TRUE))[-7],
+)
+
+sum_data
+
+```
+In this data set, there are visible variation in variables. For example, the minimum value in the "loan_amount" column is $5000, while its maximum value is much higher at $90,005,000. Similarly, for "income," we find 0 to $56,628, showing a wide range. The "interest_rate" column also has visible varation, with rates ranging from 0% to about 13%.
+
+Also, after examining the quartiles I noticed the median values (Q2) for "loan_amount", "income", and "interest_rate" are relatively close to the mean, indicating symmetric distributions.
+
+### Handling Categorical Variables
+```{r echo=TRUE}
+# Handling missing values and categorical variables
+data <- data %>%   
+  mutate(
+    approval_status = recode(approval_status,
+      `1` = "Loan originated",
+      `2` = "Approved",
+      `3` = "Denied",
+      `4` = "Withdrawn",
+      `5` = "Incomplete",
+      `6` = "Purchased",
+      `7` = "Preapproval denied",
+      `8` = "Preapproval approved",
+    )
+  ) %>% 
+  mutate(
+    county = recode(county,
+      `25001` = "Barnstable",
+      `25003` = "Berkshire",
+      `25005` = "Bristol",
+      `25007` = "Dukes",
+      `25009` = "Essex",
+      `25011` = "Franklin",
+      `25013` = "Hampden",
+      `25015` = "Hampshire",
+      `25017` = "Middlesex",
+      `25019` = "Nantucket",
+      `25021` = "Norfolk",
+      `25023` = "Plymouth",
+      `25025` = "Suffolk",
+      `25027` = "Worcester",
+    )
+  ) %>% 
+  mutate(
+    loan_type = recode(loan_type,
+      `1` = "Conventional",
+      `2` = "FHA",
+      `3` = "VA",
+      `4` = "RHS/FSA",
+    )
+  ) %>% 
+  mutate(
+    loan_purpose = recode(loan_purpose,
+      `1` = "Home purchase",
+      `2` = "Home improvement",
+      `31` = "Refinancing",
+      `32` = "Cash-out refinancing",
+      `4` = "Other purpose",
+      `5` = "Not applicable",
+    )
+  )
+
+```
+
+### Imputing Missing Data 
+
+For numeric variables with missing data, those missing values are replace with the data's median value, accounting for the potential variablity in the data. 
+
+Income is used to create a new categorical variable, "income_level" the 2022 median income: $96505 [more information about this here.](https://www.census.gov/quickfacts/fact/table/MA/INC110222)
+
+- Low Income: 50% of the median income: $96,505 * 0.50 = $48,252.50
+- Moderate Income: 75% of the median income: $96,505 * 0.75 = $72,378.75
+- Middle Income: 125% of the median income: $96,505 * 1.25 = $120,631.25
+- High Income: Any income level above $120,631.25.
+
+Other catergorical variables with missing value are "county" and "applicant_age, which are imputed with the data's mode.
+
+```{r echo=TRUE}
+
+data <- data %>%   
+  mutate(
+    income = if_else(is.na(income), median(income, na.rm = TRUE), income),
+    interest_rate = if_else(is.na(interest_rate), median(interest_rate, na.rm = TRUE), interest_rate)
+  ) %>% 
+  mutate(
+    income_level = case_when(
+      income < 48252.50/1000 ~ "Low",
+      income >= 48252.50/1000 & income < 72378.75/1000 ~ "Moderate",
+      income >= 72378.75/1000 & income <= 120631.25/1000 ~ "Middle",
+      income > 120631.25/1000 ~ "High",
+    ))
+
+# Imputing missing counties with mode
+county_mode <- data %>%
+  count(county) %>%
+  filter(n == max(n)) %>%
+  pull(county)
+
+age_mode <- data %>%
+  count(applicant_age) %>%
+  filter(n == max(n)) %>%
+  pull(applicant_age)
+
+data <- data %>%
+  mutate(
+    county = if_else(is.na(county), county_mode, county),
+    applicant_age = if_else((applicant_age == "8888"), age_mode, applicant_age)
+  )
+
+
+```
+
+
+## Distribution of Borrower Demographics
+
+This section focuses on analyzing the distribution of borrower demographics within the dataset. Understanding the demographics of borrowers is crucial for assessing the inclusivity and fairness of lending practices.
+
+### Age Distibution
+```{r echo=TRUE}
+colors <- c("#009fd4", "#6d8891", "#00a4a6", "#3455db", "#008080", "#24a159", "#1e824c")
+
+age_freq <- data %>%
+  count(applicant_age) %>% 
+  mutate(applicant_age = factor(applicant_age, levels = c("<25", "25-34", "35-44", "45-54", "55-64", "65-74", ">74"))) %>%
+  arrange(applicant_age)
+
+age_fig <- plot_ly(
+  data = age_freq,
+  values = ~n, 
+  labels = ~applicant_age,
+  type = "pie", 
+  name = "Applicant Age",
+  insidetextfont = list(color = '#FFFFFF'),
+  textposition = "inside",
+  textinfo = "label+percent",
+  marker = list(colors = colors,
+                line = list(color = '#FFFFFF', width = 1)),
+  showlegend = TRUE,
+  sort = FALSE) %>% 
+  layout(title = list(
+   text = "Age Group Distribution Among Borrowers",
+    xanchor = "center",
+    yanchor = "top"),
+    margin = list(l = 10, r = 10, t = 100))
+
+age_fig
+
+```
+Most borrowers fall into the 35-44 age group (26.7%) followed closely by those in the 45-54 age bracket (22.7%). The 25-34 (18%) and 55-64 (19.1%) age groups show slightly lower participation rates. Only a small percentage of borrowers (0.993%) are categorized as '<25'. This suggests that the majority of home buyers are middle-aged, with fewer younger borrowers.
+
+
+### Sex Distribution
+```{r echo=TRUE}
+
+sex_freq <- data %>%
+  count(applicant_sex)
+
+sex_fig <- plot_ly(
+  data = sex_freq,
+  values = ~n, 
+  labels = ~applicant_sex,
+  type = "pie", 
+  name = "Applicant Sex",
+  insidetextfont = list(color = '#FFFFFF'),
+  textposition = "inside",
+  textinfo = "label+percent",
+  marker = list(colors = colors[1: 4],
+                line = list(color = '#FFFFFF', width = 1)),
+  showlegend = TRUE,
+  sort = FALSE) %>% 
+  layout(title = list(
+   text = "Sex Distribution Among Borrowers",
+    xanchor = "center",
+    yanchor = "top"),
+    margin = list(l = 10, r = 10, t = 100))
+
+sex_fig
+
+```
+The largest segment of the distribution is categorized as 'Joint' (36%), suggesting that most applicants are couples rather than individuals. There are more male applicants (32.3%) than female applicants (22.5%). A small portion of the distribution is not available (9.14%).
+
+### Income Level Distribution
+```{r}
+
+income_level_freq <- data %>%
+  count(income_level)
+
+income_level_fig <- plot_ly(
+  data = income_level_freq,
+  values = ~n, 
+  labels = ~income_level,
+  type = "pie", 
+  name = "Income Level",
+  insidetextfont = list(color = '#FFFFFF'),
+  textposition = "inside",
+  textinfo = "label+percent",
+  marker = list(colors = colors[1:4],
+                line = list(color = '#FFFFFF', width = 1)),
+  showlegend = TRUE,
+  sort = FALSE) %>% 
+  layout(title = list(
+   text = "Income Level Distribution Among Borrowers",
+    xanchor = "center",
+    yanchor = "top"),
+    margin = list(l = 10, r = 10, t = 100))
+
+income_level_fig
+
+```
+The majority of borrowers fall into the high income level category (48.9%), earning more than $120,631.25 (in thousands). Subsequently, a significant portion falls within the middle income bracket (29.9%), followed by moderate income earners (13.3%) and the lowest proportion being individuals in the low income category (7.92%).
+
+### County Distribution
+```{r echo=TRUE}
+
+county_proportions <- prop.table(table(data$county)) * 100
+
+county_fig <- plot_ly(
+                      x = ~names(county_proportions), 
+                      y = ~county_proportions, type = "bar", 
+                      color = I(colors[1])) %>% 
+  layout(title = "Distribution of Counties",
+        xaxis = list(title = "County"),
+        yaxis = list(title = "Proportion (%)"))
+
+county_fig
+
+```
+Most borrowers are financing property in Middlesex county (20.76%), Worcester(13.25%) and Essex(11.14%). The least were Franklin(0.71%), Dukes(0.51%),and Nantucket(0.35%).
+
+
+## Loan Characteristics Across Demographic Groups
+
+This section explores loan characteristics across different demographic groups. The dataset has considerable skewness, suggesting the presence of outliers. Therefore, to better understand the distributions, we will visualize the data both with and without extreme outliers.
+
+### Loan Amount
+
+#### Distribution of Loan Amount by Age Group
+```{r echo=TRUE}
+
+loan_amount_age <- data %>% 
+  select(applicant_age, loan_amount)
+
+loan_dist_age_1 <- plot_ly(loan_amount_age, x = ~applicant_age, y = ~loan_amount, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by Age Group",
+         xaxis = list(title = "Age Group"),
+         yaxis = list(title = "Loan Amount"))
+
+# Calculate the IQR for the variable of interest
+loan_amount <- data$loan_amount
+loan_amount_q1 <- fivenum(loan_amount)[2]
+loan_amount_q3 <- fivenum(loan_amount)[4]
+loan_amount_iqr <- loan_amount_q3 - loan_amount_q1
+
+# Identify outliers
+loan_amount_outliers <- loan_amount < (loan_amount_q1 - 1.5 * loan_amount_iqr) | loan_amount > (loan_amount_q3 + 1.5 * loan_amount_iqr)
+
+# Remove outliers from the data
+loan_amount_clean <- data[!loan_amount_outliers, ]
+
+loan_dist_age_2 <- plot_ly(loan_amount_clean, x = ~applicant_age, y = ~loan_amount, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by Age Group",
+         xaxis = list(title = "Age Group"),
+         yaxis = list(title = "Loan Amount"))
+
+# Display the plot
+subplot(
+  loan_dist_age_1 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  loan_dist_age_2 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Loan Amount by Age Group (with vs without extreme outliers)")
+
+```
+The data with outliers had visibility issues due to extreme outliers. To address this, a second plot was generated after removing extreme outliers for better interpretability.
+
+In the second plot, individuals aged 25-34 emerged as the group with the highest median loan amount, standing at $375k. Their loan amounts ranged from $215k at the 25th percentile to $525k at the 75th percentile. Surprisingly, the age group 35-45, representing the largest proportion of the population, had the same median loan amount as the <25 age group, despite the latter having the smallest proportion. The individuals aged >74 had the lowest median loan amount at $205k.
+
+Across all age groups, except for >74, the loan amount distributions appeared symmetric, although outliers were noticeable in the upper bounds of the plot with extreme outliers.
+
+
+#### Distribution of Loan Amount by Sex
+```{r echo=TRUE}
+
+loan_amount_sex <- data %>% 
+  select(applicant_sex, loan_amount)
+
+loan_dist_sex_1 <- plot_ly(loan_amount_sex, x = ~applicant_sex, y = ~loan_amount, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by Sex",
+         xaxis = list(title = "Sex"),
+         yaxis = list(title = "Loan Amount"))
+
+loan_dist_sex_2 <- plot_ly(loan_amount_clean, x = ~applicant_sex, y = ~loan_amount, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by Sex",
+         xaxis = list(title = "Sex"),
+         yaxis = list(title = "Loan Amount"))
+
+# Display the plot
+subplot(
+  loan_dist_sex_1 %>% 
+    layout(
+    showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  loan_dist_sex_2 %>% 
+    layout(
+    showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Loan Amount by Sex (with vs without extreme outliers)")
+
+```
+Individuals with joint sex had the highest median loan amount with loan amounts ranged from $155k at the 25th percentile to $495k at the 75th percentile. Males followed closely with the second-highest median loan amount of $265k, while females had a slightly lower median of $235k. These findings suggest that couples tend to secure higher loan amounts compared to individuals.
+
+#### Distribution of Loan Amount by Race
+```{r echo=TRUE}
+
+loan_amount_race <- data %>% 
+  select(applicant_race, loan_amount)
+
+loan_dist_race_1 <- plot_ly(loan_amount_race, x = ~applicant_race, y = ~loan_amount, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by Race",
+         xaxis = list(title = "Race"),
+         yaxis = list(title = "Loan Amount"))
+
+loan_dist_race_2 <- plot_ly(loan_amount_clean, x = ~applicant_race, y = ~loan_amount, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by Race",
+         xaxis = list(title = "Race"),
+         yaxis = list(title = "Loan Amount"))
+
+# Display the plot
+subplot(
+  loan_dist_race_1 %>% 
+    layout(
+    showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  loan_dist_race_2 %>% 
+    layout(
+    showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Loan Amount by Race (with vs without extreme outliers)")
+
+```
+Asians have the highest median loan amount at $395k, followed by those of joint race at $355k, and Black or African American at $295k. Most plots appear symmetric, except for "2 or more minority races" and "Free Form Text Only," both of which are right-skewed. Specifically, "2 or more minority races" is notably right-skewed, with a mean loan amount of $155k, indicating a clustering of lower loan amounts within that demographic.
+
+
+#### Distribution of Loan Amount by Income Level
+```{r echo=TRUE}
+
+loan_amount_income_level <- data %>% 
+  select(income_level, loan_amount)
+
+loan_dist_income_level_1 <- plot_ly(loan_amount_income_level, x = ~income_level, y = ~loan_amount, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by Income Level",
+         xaxis = list(title = "Race"),
+         yaxis = list(title = "Loan Amount"))
+
+loan_dist_income_level_2 <- plot_ly(loan_amount_clean, x = ~income_level, y = ~loan_amount, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by Income Level",
+         xaxis = list(title = "Income Level"),
+         yaxis = list(title = "Loan Amount"))
+
+# Display the plot
+subplot(
+  loan_dist_income_level_1 %>% 
+    layout(
+    showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  loan_dist_income_level_2 %>% 
+    layout(
+    showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Loan Amount by Income Level (with vs without extreme outliers)")
+
+```
+It's no surprise that individuals of high income have the highest median loan amount of $365k. Middle income follows up with median of $275k and left skewed distribution, suggesting a concentration of higher loan amounts. Moderate income individual have median loan amount of $205k and low income with the lowest at $155k.
+
+#### Distribution of Loan Amount by County
+```{r echo=TRUE}
+
+loan_amount_county <- data %>% 
+  select(county, loan_amount)
+
+loan_dist_county_1 <- plot_ly(loan_amount_county, x = ~county, y = ~loan_amount, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by County",
+         xaxis = list(title = "County"),
+         yaxis = list(title = "Loan Amount"))
+
+loan_dist_county_2 <- plot_ly(loan_amount_clean, x = ~county, y = ~loan_amount, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Loan Amount by County",
+         xaxis = list(title = "County"),
+         yaxis = list(title = "Loan Amount"))
+
+# Display the plot
+subplot(
+  loan_dist_county_1 %>% 
+    layout(
+    showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  loan_dist_county_2 %>% 
+    layout(
+    showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Loan Amount by County (with vs without extreme outliers)")
+
+```
+Individuals financing properties in Nantucket County have the highest median loan amount of $530k, with a left-skewed distribution, indicating that they tend to receive higher loan amounts. Following is Suffolk county with median loan amount of $405k and Middlesex with $345k. Dukes county has a right skewed distribution with median loan amount of $305k, indicating lower concentration of loan amount. The county with individuals receiving the least loan amount is Franklin with median loan amount of $185k.
+
+
+### Interest Rate
+
+#### Distribution of Interest by Age Group
+```{r echo=TRUE}
+
+interest_rate_age <- data %>% 
+  select(applicant_age, interest_rate)
+
+ir_dist_age_1 <- plot_ly(interest_rate_age, x = ~applicant_age, y = ~interest_rate, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by Age Group",
+         xaxis = list(title = "Age Group"),
+         yaxis = list(title = "Interest Rate"))
+
+# Calculate the IQR for the variable of interest
+interest_rate <- data$interest_rate
+interest_rate_q1 <- fivenum(interest_rate)[2]
+interest_rate_q3 <- fivenum(interest_rate)[4]
+interest_rate_iqr <- interest_rate_q3 - interest_rate_q1
+
+# Identify outliers
+interest_rate_outliers <- interest_rate < (interest_rate_q1 - 1.5 * interest_rate_iqr) | interest_rate > (interest_rate_q3 + 1.5 * interest_rate_iqr)
+
+# Remove outliers from the data
+interest_rate_clean <- data[!interest_rate_outliers, ]
+
+ir_dist_age_2 <- plot_ly(interest_rate_clean, x = ~applicant_age, y = ~interest_rate, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by Age Group",
+         xaxis = list(title = "Age Group"),
+         yaxis = list(title = "Interest Rate"))
+
+# Display the plot
+subplot(
+  ir_dist_age_1 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  ir_dist_age_2 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Interest Rates by Age Group (with vs without extreme outliers)")
+
+```
+All age groups have the same median interest rate 4.25%. However, it's apparent that as age groups increase the skewness shifts. For example, for the age group <25, it is right skewed indicating a cluster of lower interest rates. It's the same with group 25-34. For age group 35-44 the skewness is less apparent, resembling more of a symmetric distribution. At age group 45-54, the left skewness is apparent, indicating a concentration of higher interest rates especially compared to younger age groups. It's even more left skewed for groups 55-64 and 65-74.
+
+
+#### Distribution of Interest by Sex
+```{r echo=TRUE}
+
+interest_rate_sex <- data %>% 
+  select(applicant_sex, interest_rate)
+
+ir_dist_sex_1 <- plot_ly(interest_rate_sex, x = ~applicant_sex, y = ~interest_rate, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by Sex",
+         xaxis = list(title = "Sex"),
+         yaxis = list(title = "Interest Rate"))
+
+ir_dist_sex_2 <- plot_ly(interest_rate_clean, x = ~applicant_sex, y = ~interest_rate, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by Sex",
+         xaxis = list(title = "Sex"),
+         yaxis = list(title = "Interest Rate"))
+
+# Display the plot
+subplot(
+  ir_dist_sex_1 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  ir_dist_sex_2 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Interest Rates by Age Group (with vs without extreme outliers)")
+
+```
+All age groups have the same median interest rate of 4.25%. With better visibility for the plot with outliers, the outliers for each sex distribution are on both bounds. There appears to be right skewness on plots for individual gender(Female, Male) distributions, indicating lower interest rates.  In contrast, the joint sex distribution appears more symmetric.
+
+
+#### Distribution of Interest by Race
+```{r echo=TRUE}
+
+interest_rate_race <- data %>% 
+  select(applicant_race, interest_rate)
+
+ir_dist_race_1 <- plot_ly(interest_rate_race, x = ~applicant_race, y = ~interest_rate, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by Race",
+         xaxis = list(title = "Race"),
+         yaxis = list(title = "Interest Rate"))
+
+ir_dist_race_2 <- plot_ly(interest_rate_clean, x = ~applicant_race, y = ~interest_rate, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by Race",
+         xaxis = list(title = "Race"),
+         yaxis = list(title = "Interest Rate"))
+
+# Display the plot
+subplot(
+  ir_dist_race_1 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  ir_dist_race_2 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Interest Rates by Race (with vs without extreme outliers)")
+
+```
+All age groups have a consistent median interest rate of 4.25%. Asian, Joint race, and Native Hawaiian or Other Pacific Islander distributions display right skewness, suggesting a concentration of higher interest rates. The distribution for White individuals appears more symmetric. However, for the remaining racial groups, such as Black or African American, American Indian or Alaska Native, and those with "2 or more minority races," the patterns are less visible from the plot.
+
+#### Distribution of Interest by Income Level
+```{r echo=TRUE}
+
+interest_rate_income_level <- data %>% 
+  select(income_level, interest_rate)
+
+ir_dist_income_1 <- plot_ly(interest_rate_income_level, x = ~income_level, y = ~interest_rate, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by Income Level",
+         xaxis = list(title = "Income Level"),
+         yaxis = list(title = "Interest Rate"))
+
+ir_dist_income_2 <- plot_ly(interest_rate_clean, x = ~income_level, y = ~interest_rate, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by Income Level",
+         xaxis = list(title = "Income Level"),
+         yaxis = list(title = "Interest Rate"))
+
+# Display the plot
+subplot(
+  ir_dist_income_1 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  ir_dist_income_2 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Interest Rates by Income Level (with vs without extreme outliers)")
+
+```
+All age groups have the same median interest rate of 4.25%. Both high and moderate income distributions appear to be left skewed, indicating cluster of higher interest rates. Middle appears to follow a symmetric distribution. 
+
+
+#### Distribution of Interest by County
+```{r echo=TRUE}
+
+interest_rate_county <- data %>% 
+  select(county, interest_rate)
+
+ir_dist_county_1 <- plot_ly(interest_rate_county, x = ~county, y = ~interest_rate, color = I(colors[4]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by County",
+         xaxis = list(title = "County"),
+         yaxis = list(title = "Interest Rate"))
+
+ir_dist_county_2 <- plot_ly(interest_rate_clean, x = ~county, y = ~interest_rate, color = I(colors[1]), type = "box") %>%
+  layout(title = "Distribution of Interest Rates by County",
+         xaxis = list(title = "County"),
+         yaxis = list(title = "Interest Rate"))
+
+# Display the plot
+subplot(
+  ir_dist_county_1 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "With Outliers"), 
+  ir_dist_county_2 %>% 
+    layout(
+           showlegend = FALSE) %>% 
+    add_trace(name = "Without Outliers"), 
+  nrows = 2,
+  shareX = TRUE
+) %>% layout(title = "Interest Rates by County (with vs without extreme outliers)")
+
+```
+All age groups have the same median interest rate of 4.25%. Counties like Berkshire, Nantucket, Dukes and Frank have apparent left skewness, indicating concentration on higher interest rates in those groups. Counties like Plymouth and Hampden have right skewed data indication concentration of lower interest rates.
+
+
+## Sampling 
+
+### Central Limit Theorem
+
+#### Distribution of Loan Amount of Population
+```{r echo=TRUE}
+
+plot_ly(
+    x = ~data$loan_amount, 
+    type = "histogram",
+    color = I(colors[1]))  %>%
+    layout(
+      title = "Distribution of Loan Amount",
+      xaxis = list(title = "Loan Amount"), 
+      yaxis = list(title = "Frequency"), 
+      showlegend = FALSE)
+
+cat("Population Size = ", length(data$loan_amount), " Mean = ", mean(data$loan_amount),
+      " SD = ", sd(data$loan_amount), "\n")
+```
+The histogram resembles an exponential distribution, with a right-skewed pattern, suggesting that the majority of loan amounts are concentrated towards the lower end, with fewer instances of higher loan amounts. 
+
+The large mean value of $356,259.7 and standard deviation of $361,120.6, emphasizes the variability in the loan amounts likely the cause of the long tail histogram and the presence of potential outliers, particularly towards the higher end of the loan amount range of values. This suggests that there are cases where borrowers require significantly larger loan amounts compared to the majority.
+
+
+#### Distribution of Loan Amount of Different Sample Sizes
+```{r echo=TRUE}
+samples <- 5000
+xbar <- numeric(samples)
+
+subplot_list <- list()
+
+set.seed(7472)
+for (size in c(200, 400, 600, 800)) {
+  for (i in 1:samples) {
+    xbar[i] <- mean(sample(data$loan_amount, size, replace = FALSE))
+  }
+  
+  subplot_list[[length(subplot_list) + 1]] <- plot_ly(
+    x = ~xbar, 
+    type = "histogram",
+    name = paste("Sample Size =", size),
+    marker = list(color = colors[length(subplot_list) + 1])) %>%
+    layout(
+      xaxis = list(title = "Loan Amount"), 
+      yaxis = list(title = "Frequency"), 
+      showlegend = TRUE)
+  
+   cat("Sample Size = ", size, " Mean = ", mean(xbar),
+      " SD = ", sd(xbar), "\n")
+}
+
+
+subplot(subplot_list[[1]], subplot_list[[2]], subplot_list[[3]], subplot_list[[4]], nrows = 2)
+
+```
+For sample sizes of 200, 400, 600, and 800, the mean loan amounts are approximately $356,317.4, $356,521.4, $356,621.3, and $356,159.9, respectively. They are all approximately centered around the population mean, indicating central tendency. The distributions of sample means resemble the shape of a normal distribution, which supports the Central Limit Theorem.
+
+Also, as the sample size increases from 200 to 800, the standard deviation of the sample shows a decrease. The standard deviations for sample sizes of 200, 400, 600, and 800 are $24,723.25, $17,624.46, $14,361.33, and $12,243.76, respectively. This indicates that as the
+sample size increases, the standard deviation decreases, resulting in a narrower spread.
+of the data.
+
+
+### Sampling Methods
+
+#### Comparison of Approval Rates by Applicant Age Across Sampling Methods
+```{r echo=TRUE}
+
+# Population
+
+total_loans <- nrow(data)
+
+approval_rate_age <- data %>% 
+  group_by(applicant_age) %>% 
+  summarise(approval_rate = sum(approval_status == "Loan originated" | approval_status == "Approved") / total_loans  * 100)
+
+
+# Simple Random Sampling Without Replacement
+
+N <-  nrow(data)
+n <-  1000
+
+set.seed(7472)
+srs_s <- srswor(n = n, N = N)
+srs_sample <- data[srs_s != 0, ]
+
+srs_total_loans <- nrow(srs_sample)
+
+srs_approval_rate_age <- srs_sample %>% 
+  group_by(applicant_age) %>% 
+  summarise(approval_rate = sum(approval_status == "Loan originated" | approval_status == "Approved") / srs_total_loans  * 100)
+
+
+# Systematic Sampling
+
+k <- ceiling(N / n)
+r <- sample(k, 1)
+ss_s <- seq(r, by = k, length = n)
+ss_sample <- data[ss_s, ]
+
+ss_total_loans <- nrow(ss_sample)
+
+ss_approval_rate_age <- ss_sample %>% 
+  group_by(applicant_age) %>% 
+  summarise(approval_rate = sum(approval_status == "Loan originated" | approval_status == "Approved") / ss_total_loans  * 100) %>% 
+  filter(!is.na(applicant_age) & !is.na(approval_rate))
+
+# Stratified Sampling
+
+order.index <- order(data$applicant_age)
+st_data <- data[order.index, ]
+
+freq <- table(data$applicant_age)
+
+st_sizes <- round(1000 * freq / sum(freq))
+
+st <- strata(
+  st_data, 
+  stratanames = c("applicant_age"),
+  size = st_sizes, 
+  method = "srswor"
+)
+
+st_sample <- getdata(st_data, st)
+
+st_total_loans <- nrow(st_sample)
+
+st_approval_rate_age <- st_sample %>% 
+  group_by(applicant_age) %>% 
+  summarise(approval_rate = sum(approval_status == "Loan originated" | approval_status == "Approved") / st_total_loans  * 100)
+
+subplot_list <- list()
+
+# Population
+subplot_list[[1]] <- plot_ly(approval_rate_age, x = ~applicant_age, y = ~approval_rate, type = "bar", name = "Population", color = I(colors[1]))
+
+# Simple Random Sampling Without Replacement
+subplot_list[[2]] <- plot_ly(srs_approval_rate_age, x = ~applicant_age, y = ~approval_rate, type = "bar", name = "SRS", color = I(colors[7]))
+
+# Systematic Sampling
+subplot_list[[3]] <- plot_ly(ss_approval_rate_age, x = ~applicant_age, y = ~approval_rate, type = "bar", name = "Systematic Sampling", color = I(colors[4]))
+
+# Stratified Sampling
+subplot_list[[4]] <- plot_ly(st_approval_rate_age, x = ~applicant_age, y = ~approval_rate, type = "bar", name = "Stratified Sampling", color = I(colors[3]))
+
+
+subplot(subplot_list, nrows = 2) %>% layout(title = "Approval Rates by Applicant Age Across Sampling Methods")
+
+```
+Population Trends: In the population data, the approval rates vary across different age groups. The highest approval rates are observed in the age groups 35-44 and 45-54, with approximately 15.8% and 13.7%, respectively. The age groups <25 and >74 have notably lower approval rates, approximately 1.1% and 1.6%, respectively.
+
+Sampling Method Comparisons:
+
+- Simple Random Sampling: The SRS method has approval rates that are similar to those observed in the population data. Age groups 35-44 and 45-54 continue to have relatively high approval rates, while <25 and >74 maintain lower approval rates.
+- Systematic Sampling: Similar to SRS, systematic sampling also reflects comparable approval rates across age groups, although slight variations may occur due to the sampling technique. Overall, the trends remain consistent with the population data.
+- Stratified Sampling: Stratified sampling, which involves dividing the population into homogeneous subgroups before sampling, produces approval rates that closely mirror those of the population. Each age group's approval rate aligns with its corresponding rate in the population data, indicating that the sampling method effectively captures the approval rate variations across different age groups.
+
+
+## Conclusion
+
+In conclusion, after analyzing the lending practices in Massachusetts using the 2022 HMDA dataset, several key findings were rvealed:
+
+Borrower Demographics:
+
+- Middle-aged individuals (35-44) make up the largest group of borrowers.
+- Joint sex(couples) are the most common applicants, followed by males and females.
+- High-income individuals represent the majority of borrowers, with fewer in the low-income category.
+- Property financing is most popular in Middlesex, Worcester, and Essex counties.
+
+Loan Characteristics:
+
+- Loan amounts vary across demographics, with disparities based on age, sex, race, and income level.
+- Joint applicants typically secure higher loan amounts compared to individuals.
+- Racial disparities are evident, with Asians and Joint race borrowers obtaining higher median loan amounts.
+- Income level significantly influences loan amounts, with high-income individuals receiving the most.
+
+Interest Rate:
+
+- The median interest rate remains consistent across demographics, but skewness varies.
+- Younger age groups show right-skewed distributions, while older age groups exhibit left-skewed patterns.
+- Joint sex applicants have a more symmetric distribution of interest rates compared to individuals.
+
+Sampling Methods:
+
+- Central Limit Theorem holds true, with sample means approximating the population mean as sample sizes increase.
+- Different sampling methods produce approval rate estimates closely resembling population data.
